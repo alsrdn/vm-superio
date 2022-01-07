@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::result::Result;
 use std::sync::Arc;
 
-use crate::Trigger;
+use vm_device::interrupt::trigger::Trigger;
 
 // Register offsets.
 // Receiver and Transmitter registers offset, depending on the I/O

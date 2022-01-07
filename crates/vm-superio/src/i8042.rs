@@ -11,7 +11,7 @@
 
 use std::result::Result;
 
-use crate::Trigger;
+use vm_device::interrupt::trigger::Trigger;
 
 // Offset of the command register, for write accesses (port 0x64). The same
 // offset can be used, in case of read operations, to access the status
