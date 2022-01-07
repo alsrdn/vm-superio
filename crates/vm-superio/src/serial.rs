@@ -406,6 +406,11 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         &self.interrupt_evt
     }
 
+    /// Modifies the interrupt trigger.
+    pub fn set_interrupt_evt(&mut self, evt: T) {
+        self.interrupt_evt = evt;
+    }
+
     /// Provides a reference to the serial events object.
     pub fn events(&self) -> &EV {
         &self.events
