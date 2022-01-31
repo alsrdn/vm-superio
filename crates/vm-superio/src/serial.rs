@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::result::Result;
 use std::sync::Arc;
 
-use vm_device::interrupt::trigger::Trigger;
+use vm_device::interrupt::{Interrupt, EdgeInterrupt};
 
 // Register offsets.
 // Receiver and Transmitter registers offset, depending on the I/O
@@ -256,7 +256,7 @@ impl Default for SerialState {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Serial<T: Trigger, EV: SerialEvents, W: Write> {
+pub struct Serial<I: Interrupt, EV: SerialEvents, W: Write> {
     // Some UART registers.
     baud_divisor_low: u8,
     baud_divisor_high: u8,
@@ -273,23 +273,23 @@ pub struct Serial<T: Trigger, EV: SerialEvents, W: Write> {
     in_buffer: VecDeque<u8>,
 
     // Used for notifying the driver about some in/out events.
-    interrupt_evt: T,
+    interrupt_evt: Option<Arc<I>>,
     events: EV,
     out: W,
 }
 
 /// Errors encountered while handling serial console operations.
 #[derive(Debug)]
-pub enum Error<E> {
+pub enum Error {
     /// Failed to trigger interrupt.
-    Trigger(E),
+    Trigger(vm_device::interrupt::Error),
     /// Couldn't write/flush to the given destination.
     IOError(io::Error),
     /// No space left in FIFO.
     FullFifo,
 }
 
-impl<T: Trigger, W: Write> Serial<T, NoEvents, W> {
+impl<I: Interrupt + EdgeInterrupt, W: Write> Serial<I, NoEvents, W> {
     /// Creates a new `Serial` instance which writes the guest's output to
     /// `out` and uses `trigger` object to notify the driver about new
     /// events.
@@ -306,12 +306,12 @@ impl<T: Trigger, W: Write> Serial<T, NoEvents, W> {
     ///
     /// You can see an example of how to use this function in the
     /// [`Example` section from `Serial`](struct.Serial.html#example).
-    pub fn new(trigger: T, out: W) -> Serial<T, NoEvents, W> {
-        Self::with_events(trigger, NoEvents, out)
+    pub fn new(trigger: Arc<I>, out: W) -> Serial<I, NoEvents, W> {
+        Self::with_events(Some(trigger), NoEvents, out)
     }
 }
 
-impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
+impl<I: Interrupt + EdgeInterrupt, EV: SerialEvents, W: Write> Serial<I, EV, W> {
     /// Creates a new `Serial` instance from a given `state`, which writes the guest's output to
     /// `out`, uses `trigger` object to notify the driver about new
     /// events, and invokes the `serial_evts` implementation of `SerialEvents`
@@ -331,10 +331,10 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     ///           can be used here.
     pub fn from_state(
         state: &SerialState,
-        trigger: T,
+        trigger: Option<Arc<I>>,
         serial_evts: EV,
         out: W,
-    ) -> Result<Self, Error<T::E>> {
+    ) -> Result<Self, Error> {
         if state.in_buffer.len() > FIFO_SIZE {
             return Err(Error::FullFifo);
         }
@@ -350,7 +350,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
             modem_status: state.modem_status,
             scratch: state.scratch,
             in_buffer: VecDeque::from(state.in_buffer.clone()),
-            interrupt_evt: trigger,
+            interrupt_evt: trigger.clone(),
             events: serial_evts,
             out,
         };
@@ -379,7 +379,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     ///           is not of interest,
     ///           [std::io::Sink](https://doc.rust-lang.org/std/io/struct.Sink.html)
     ///           can be used here.
-    pub fn with_events(trigger: T, serial_evts: EV, out: W) -> Self {
+    pub fn with_events(trigger: Option<Arc<I>>, serial_evts: EV, out: W) -> Self {
         // Safe because we are using the default state that has an appropriately size input buffer
         // and there are no pending interrupts to be triggered.
         Self::from_state(&SerialState::default(), trigger, serial_evts, out).unwrap()
@@ -402,13 +402,17 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     }
 
     /// Provides a reference to the interrupt event object.
-    pub fn interrupt_evt(&self) -> &T {
-        &self.interrupt_evt
+    pub fn interrupt_evt(&self) -> Option<&I> {
+        if let Some(evt) = &self.interrupt_evt {
+            Some(evt)
+        } else {
+            None
+        }
     }
 
     /// Modifies the interrupt trigger.
-    pub fn set_interrupt_evt(&mut self, evt: T) {
-        self.interrupt_evt = evt;
+    pub fn set_interrupt_evt(&mut self, evt: Arc<I>) {
+        self.interrupt_evt = Some(evt.clone());
     }
 
     /// Provides a reference to the serial events object.
@@ -440,8 +444,12 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         (self.modem_control & MCR_LOOP_BIT) != 0
     }
 
-    fn trigger_interrupt(&mut self) -> Result<(), T::E> {
-        self.interrupt_evt.trigger()
+    fn trigger_interrupt(&mut self) -> Result<(), vm_device::interrupt::Error> {
+        if let Some(evt) = &self.interrupt_evt {
+            evt.trigger()
+        } else {
+            Err(vm_device::interrupt::Error::InterruptNotTriggered)
+        }
     }
 
     fn set_lsr_rda_bit(&mut self) {
@@ -464,7 +472,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         }
     }
 
-    fn thr_empty_interrupt(&mut self) -> Result<(), T::E> {
+    fn thr_empty_interrupt(&mut self) -> Result<(), vm_device::interrupt::Error> {
         if self.is_thr_interrupt_enabled() {
             // Trigger the interrupt only if the identification bit wasn't
             // set or acknowledged.
@@ -476,7 +484,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
         Ok(())
     }
 
-    fn received_data_interrupt(&mut self) -> Result<(), T::E> {
+    fn received_data_interrupt(&mut self) -> Result<(), vm_device::interrupt::Error> {
         if self.is_rda_interrupt_enabled() {
             // Trigger the interrupt only if the identification bit wasn't
             // set or acknowledged.
@@ -504,7 +512,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     ///
     /// You can see an example of how to use this function in the
     /// [`Example` section from `Serial`](struct.Serial.html#example).
-    pub fn write(&mut self, offset: u8, value: u8) -> Result<(), Error<T::E>> {
+    pub fn write(&mut self, offset: u8, value: u8) -> Result<(), Error> {
         match offset {
             DLAB_LOW_OFFSET if self.is_dlab_set() => self.baud_divisor_low = value,
             DLAB_HIGH_OFFSET if self.is_dlab_set() => self.baud_divisor_high = value,
@@ -651,7 +659,7 @@ impl<T: Trigger, EV: SerialEvents, W: Write> Serial<T, EV, W> {
     ///
     /// You can see an example of how to use this function in the
     /// [`Example` section from `Serial`](struct.Serial.html#example).
-    pub fn enqueue_raw_bytes(&mut self, input: &[u8]) -> Result<usize, Error<T::E>> {
+    pub fn enqueue_raw_bytes(&mut self, input: &[u8]) -> Result<usize, Error> {
         let mut write_count = 0;
         if !self.is_in_loop_mode() {
             if self.fifo_capacity() == 0 {
